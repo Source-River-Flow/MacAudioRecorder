@@ -10,146 +10,117 @@ private func expectEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: St
     }
 }
 
-private func expect(_ condition: Bool, _ message: String) throws {
-    guard condition else {
-        throw TestFailure(description: message)
-    }
-}
-
-private func feed(
-    _ assembler: inout TranscriptAssembler,
-    _ text: String,
-    isFinal: Bool = false,
-    at time: TimeInterval
-) {
-    assembler.update(
-        text: text,
-        isFinal: isFinal,
-        timestampCandidate: time,
-        endTimestamp: time,
-        speakerNumber: { _, _ in 1 }
-    )
-}
-
-private func committedTexts(_ assembler: TranscriptAssembler) -> [String] {
-    assembler.committedLines.map(\.text)
-}
-
-private func testPartialLadderDoesNotDuplicate() throws {
+private func testPartialUpdatesShowAsLiveText() throws {
     var assembler = TranscriptAssembler()
 
-    feed(&assembler, "Well, the", at: 0)
-    try expectEqual(assembler.committedDisplayText, "", "Unfinished partials should not be displayed as committed transcript.")
-
-    feed(&assembler, "Well, the wealthy are living", at: 1)
-    try expectEqual(assembler.committedDisplayText, "", "Expanding partials should stay hidden until committed.")
-
-    feed(&assembler, "Well, the wealthy are living their best lives.", at: 2)
-
-    try expectEqual(committedTexts(assembler), ["Well, the wealthy are living their best lives."], "Completed sentence should commit once.")
-    try expectEqual(assembler.committedDisplayText, "00:00: Speaker 1: Well, the wealthy are living their best lives.", "Committed display should show only finalized sentence lines.")
-    try expectEqual(assembler.liveLine?.text, nil, "No live line should remain after a completed sentence.")
+    assembler.update(text: "Hello world", isFinal: false, timestamp: 0)
+    try expectEqual(assembler.liveText, "Hello world", "Partial update should set liveText.")
+    try expectEqual(assembler.committedLines.count, 0, "Partial update should not commit.")
+    try expectEqual(assembler.displayText, "00:00: Hello world", "Display should show timestamped live text.")
 }
 
-private func testCompletedSentencesStayPermanentWhenLaterHypothesisChangesThem() throws {
+private func testFinalUpdateCommitsWithTimestamp() throws {
     var assembler = TranscriptAssembler()
 
-    feed(&assembler, "Hi. Fine. Let's have a meeting", at: 0)
-    try expectEqual(committedTexts(assembler), ["Hi.", "Fine."], "Two complete sentences should become permanent immediately.")
-    try expectEqual(assembler.liveLine?.text, "Let's have a meeting", "Trailing incomplete sentence should stay live.")
-
-    feed(&assembler, "Hello. Fine. Let's have a meeting today", at: 1)
-    try expectEqual(committedTexts(assembler), ["Hi.", "Fine."], "Autocorrect should not rewrite permanent sentences.")
-    try expectEqual(assembler.liveLine?.text, "Let's have a meeting today", "Only the unfinished tail should update.")
+    assembler.update(text: "Hello world", isFinal: true, timestamp: 5)
+    try expectEqual(assembler.committedLines, ["00:05: Hello world"], "Final update should commit with timestamp.")
+    try expectEqual(assembler.liveText, "", "Final update should clear live text.")
 }
 
-private func testShorterLaterHypothesisDoesNotDeleteCommittedSentences() throws {
+private func testMultipleFinalUpdatesAppendAsLines() throws {
     var assembler = TranscriptAssembler()
 
-    feed(&assembler, "One. Two. Three. Four is still live", at: 0)
-    try expectEqual(committedTexts(assembler), ["One.", "Two.", "Three."], "First three sentences should be committed.")
-
-    feed(&assembler, "One. Two. Four changed", at: 1)
-    try expectEqual(committedTexts(assembler), ["One.", "Two.", "Three."], "A shorter revised hypothesis must not delete permanent text.")
-    try expectEqual(assembler.liveLine?.text, "changed", "The remaining live tail should be bounded after committed words.")
+    assembler.update(text: "First chunk.", isFinal: true, timestamp: 0)
+    assembler.update(text: "Second chunk.", isFinal: true, timestamp: 5)
+    try expectEqual(assembler.committedLines.count, 2, "Each final should add a line.")
+    try expectEqual(assembler.displayText, "00:00: First chunk.\n\n00:05: Second chunk.", "Lines should be separated by double newline.")
 }
 
-private func testLiveSentenceAutocorrectsUntilCommitted() throws {
+private func testCommitLiveMovesToCommittedLines() throws {
     var assembler = TranscriptAssembler()
 
-    feed(&assembler, "I just really like cockies now", at: 0)
-    feed(&assembler, "I just really like cookies now", at: 1)
-    feed(&assembler, "I just really like cookies now.", at: 2)
-
-    try expectEqual(committedTexts(assembler), ["I just really like cookies now."], "Current unfinished sentence should accept autocorrect before commit.")
+    assembler.update(text: "In progress", isFinal: false, timestamp: 10)
+    assembler.commitLive()
+    try expectEqual(assembler.committedLines, ["00:10: In progress"], "Commit should move live to committed lines.")
+    try expectEqual(assembler.liveText, "", "Commit should clear live text.")
 }
 
-private func testPunctuationChangeInCommittedPrefixDoesNotLeakPunctuation() throws {
+private func testPartialOverwritesPreviousPartial() throws {
     var assembler = TranscriptAssembler()
 
-    feed(&assembler, "Hello world.", at: 0)
-    feed(&assembler, "Hello, world. How are you?", at: 1)
-
-    try expectEqual(
-        committedTexts(assembler),
-        ["Hello world.", "How are you?"],
-        "Committed prefix with punctuation changes should be stripped cleanly. Live: \(assembler.liveLine?.text ?? "nil")"
-    )
-    try expectEqual(assembler.liveLine?.text, nil, "Both sentences should be committed.")
+    assembler.update(text: "Hello", isFinal: false, timestamp: 0)
+    assembler.update(text: "Hello world", isFinal: false, timestamp: 0)
+    try expectEqual(assembler.liveText, "Hello world", "Later partial should replace earlier one.")
+    try expectEqual(assembler.committedLines.count, 0, "Committed should be untouched by partials.")
 }
 
-private func testSingleUpdateWithMultipleSentencesAssignsMonotonicTimestampsWithoutCallback() throws {
+private func testDisplayTextCombinesCommittedAndLive() throws {
     var assembler = TranscriptAssembler()
 
-    feed(&assembler, "First sentence.", at: 0)
-    feed(&assembler, "First sentence. Second sentence. Third is live", at: 0.2)
-
-    try expectEqual(committedTexts(assembler), ["First sentence.", "Second sentence."], "Second complete sentence should commit.")
-    try expect(assembler.committedLines[1].timestamp >= assembler.committedLines[0].endTimestamp, "Committed timestamps should not move backward.")
-    try expect((assembler.liveLine?.timestamp ?? -1) >= assembler.committedLines[1].endTimestamp, "Live timestamp should not move backward after a same-update commit.")
+    assembler.update(text: "Done.", isFinal: true, timestamp: 0)
+    assembler.update(text: "Still going", isFinal: false, timestamp: 5)
+    try expectEqual(assembler.displayText, "00:00: Done.\n\n00:05: Still going", "Display should combine committed and live text.")
 }
 
-private func testSpeakerCallbackReceivesPreviousEndWithoutReadingAssembler() throws {
+private func testResetClearsEverything() throws {
     var assembler = TranscriptAssembler()
-    var previousEndValues: [TimeInterval] = []
 
-    assembler.update(
-        text: "First. Second.",
-        isFinal: false,
-        timestampCandidate: 0,
-        endTimestamp: 2,
-        speakerNumber: { _, previousEnd in
-            previousEndValues.append(previousEnd)
-            return 1
-        }
-    )
+    assembler.update(text: "Some text.", isFinal: true, timestamp: 0)
+    assembler.update(text: "Live", isFinal: false, timestamp: 5)
+    assembler.reset()
 
-    try expectEqual(previousEndValues, [0, 2], "Speaker callback should receive previous committed end timestamp.")
+    try expectEqual(assembler.committedLines.count, 0, "Reset should clear committed lines.")
+    try expectEqual(assembler.liveText, "", "Reset should clear live text.")
+    try expectEqual(assembler.displayText, "", "Reset should clear display text.")
 }
 
-private func testPauseCommittedLiveChunkIsStrippedFromLaterPartials() throws {
+private func testEmptyTextIsIgnored() throws {
     var assembler = TranscriptAssembler()
 
-    feed(&assembler, "This has no punctuation yet", at: 0)
-    assembler.commitLiveLine(speakerNumber: { _, _ in 1 })
-    feed(&assembler, "This has no punctuation yet and now continues.", at: 2)
+    assembler.update(text: "", isFinal: true, timestamp: 0)
+    try expectEqual(assembler.committedLines.count, 0, "Empty text should be ignored.")
 
-    try expectEqual(
-        committedTexts(assembler),
-        ["This has no punctuation yet", "and now continues."],
-        "A pause-committed chunk should become part of the stripped committed prefix."
-    )
+    assembler.update(text: "   ", isFinal: true, timestamp: 0)
+    try expectEqual(assembler.committedLines.count, 0, "Whitespace-only text should be ignored.")
+}
+
+private func testTimestampFormatting() throws {
+    var assembler = TranscriptAssembler()
+
+    assembler.update(text: "At zero.", isFinal: true, timestamp: 0)
+    assembler.update(text: "At one minute.", isFinal: true, timestamp: 60)
+    assembler.update(text: "At ten minutes five seconds.", isFinal: true, timestamp: 605)
+
+    try expectEqual(assembler.committedLines[0], "00:00: At zero.", "Zero should format as 00:00.")
+    try expectEqual(assembler.committedLines[1], "01:00: At one minute.", "60s should format as 01:00.")
+    try expectEqual(assembler.committedLines[2], "10:05: At ten minutes five seconds.", "605s should format as 10:05.")
+}
+
+private func testOldTextNeverErased() throws {
+    var assembler = TranscriptAssembler()
+
+    assembler.update(text: "Line one.", isFinal: true, timestamp: 0)
+    assembler.update(text: "Line two.", isFinal: true, timestamp: 4)
+    assembler.update(text: "Line three.", isFinal: true, timestamp: 8)
+
+    let display = assembler.displayText
+    try expectEqual(display.contains("Line one."), true, "Old lines must remain in display.")
+    try expectEqual(display.contains("Line two."), true, "Old lines must remain in display.")
+    try expectEqual(display.contains("Line three."), true, "Latest line must appear in display.")
+    try expectEqual(assembler.committedLines.count, 3, "All three lines should be committed.")
 }
 
 private func runTests() throws {
-    try testPartialLadderDoesNotDuplicate()
-    try testCompletedSentencesStayPermanentWhenLaterHypothesisChangesThem()
-    try testShorterLaterHypothesisDoesNotDeleteCommittedSentences()
-    try testLiveSentenceAutocorrectsUntilCommitted()
-    try testPunctuationChangeInCommittedPrefixDoesNotLeakPunctuation()
-    try testSingleUpdateWithMultipleSentencesAssignsMonotonicTimestampsWithoutCallback()
-    try testSpeakerCallbackReceivesPreviousEndWithoutReadingAssembler()
-    try testPauseCommittedLiveChunkIsStrippedFromLaterPartials()
+    try testPartialUpdatesShowAsLiveText()
+    try testFinalUpdateCommitsWithTimestamp()
+    try testMultipleFinalUpdatesAppendAsLines()
+    try testCommitLiveMovesToCommittedLines()
+    try testPartialOverwritesPreviousPartial()
+    try testDisplayTextCombinesCommittedAndLive()
+    try testResetClearsEverything()
+    try testEmptyTextIsIgnored()
+    try testTimestampFormatting()
+    try testOldTextNeverErased()
 }
 
 @main

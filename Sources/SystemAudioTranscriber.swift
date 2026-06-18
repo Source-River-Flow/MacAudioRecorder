@@ -3,7 +3,6 @@ import AVFoundation
 import CoreAudio
 import Darwin
 import Foundation
-import Speech
 
 @MainActor
 final class SystemAudioTranscriber: NSObject, ObservableObject {
@@ -23,9 +22,7 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
     }
 
     private var audioCapture: ProcessTapAudioCapture?
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    private var speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    private let whisper = WhisperTranscriber()
     private var sessionStartDate: Date?
     private var sessionEventMessages: [String] = []
     private var sessionAudioFrameCount: AVAudioFramePosition = 0
@@ -33,18 +30,14 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
     private var sessionAudioSampleRate: Double?
     private var sessionFilesWritten = false
     private var transcriptAssembler = TranscriptAssembler()
-    private var currentRecognitionBaseFrameCount: AVAudioFramePosition = 0
-    private var audioVoiceProfiles: [AudioVoiceProfile] = []
-    private var lastCommittedVoiceProfile: AudioVoiceProfile?
-    private var currentSpeakerNumber = 1
-    private var stableChunkCommitTask: Task<Void, Never>?
-    private var transcriptUpdateSequence = 0
     private var hasUserPressedStart = false
+    private var modelLoaded = false
 
     override init() {
         let timestamp = Self.logTimeFormatter.string(from: Date())
         logMessages = ["[\(timestamp)] App launched idle. Recording will not start until Start is clicked."]
         super.init()
+        preloadModel()
     }
 
     func start() {
@@ -52,41 +45,27 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
         hasUserPressedStart = true
         beginSession()
         log("Start button pressed.")
-        setStatus("Requesting speech recognition permission...")
-        log("Calling SFSpeechRecognizer.requestAuthorization.")
 
-        SFSpeechRecognizer.requestAuthorization { [weak self] authorizationStatus in
-            Task { @MainActor in
-                guard let self else { return }
+        guard modelLoaded else {
+            setStatus("Whisper model not loaded. Cannot start.")
+            return
+        }
 
-                self.log("Speech authorization callback returned: \(authorizationStatus.description).")
-
-                guard authorizationStatus == .authorized else {
-                    self.setStatus("Speech recognition permission was not granted.")
-                    self.log("Speech authorization result: \(authorizationStatus.description)")
-                    return
-                }
-
-                self.log("Speech recognition permission granted.")
-                await self.startCapture()
-            }
+        Task {
+            await startCapture()
         }
     }
 
     func stop() {
-        guard isRunning || audioCapture != nil || recognitionTask != nil else { return }
+        guard isRunning || audioCapture != nil else { return }
 
         setStatus("Stopping...")
         isRunning = false
-        stableChunkCommitTask?.cancel()
-        stableChunkCommitTask = nil
         log("Stopping transcription.")
-        commitCurrentTranscriptLine()
 
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        recognitionRequest = nil
+        whisper.stop()
+        transcriptAssembler.commitLive()
+        refreshTranscriptText()
 
         do {
             try audioCapture?.stop()
@@ -120,34 +99,43 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
         }
     }
 
+    private func preloadModel() {
+        let modelPath = Self.modelPath
+        log("Looking for whisper model at: \(modelPath)")
+
+        guard FileManager.default.fileExists(atPath: modelPath) else {
+            log("Whisper model not found at \(modelPath)")
+            return
+        }
+
+        modelLoaded = whisper.loadModel(at: modelPath) { [weak self] message in
+            Task { @MainActor in
+                self?.log(message)
+            }
+        }
+    }
+
     private func startCapture() async {
         guard hasUserPressedStart else {
             log("Ignoring capture start because Start has not been clicked.")
             return
         }
 
-        log("Preparing to create Speech request and Core Audio tap.")
-
-        guard let speechRecognizer else {
-            setStatus("English speech recognition is unavailable on this Mac.")
-            return
-        }
-
-        guard speechRecognizer.isAvailable else {
-            setStatus("Speech recognizer is currently unavailable.")
-            return
-        }
+        log("Preparing Core Audio tap for whisper transcription.")
 
         do {
             setStatus("Preparing system audio capture...")
-            startRecognitionTask()
+
+            whisper.start { [weak self] text, isFinal, timestamp in
+                Task { @MainActor in
+                    guard let self, self.isRunning else { return }
+                    self.transcriptAssembler.update(text: text, isFinal: isFinal, timestamp: timestamp)
+                    self.refreshTranscriptText()
+                }
+            }
 
             let capture = ProcessTapAudioCapture { [weak self] buffer in
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.recordCapturedBuffer(buffer)
-                    self.recognitionRequest?.append(buffer)
-                }
+                self?.whisper.appendAudio(buffer)
             } onLog: { [weak self] message in
                 Task { @MainActor in
                     self?.log(message)
@@ -164,22 +152,14 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
             try capture.start()
             audioCapture = capture
             isRunning = true
-            setStatus("Listening to system audio...")
+            setStatus("Listening to system audio (whisper)...")
         } catch {
             setStatus("Could not start: \(error.localizedDescription)")
             log("Start error: \(error.diagnosticDescription)")
-            cleanupAfterFailedStart()
+            try? audioCapture?.stop()
+            audioCapture = nil
+            isRunning = false
         }
-    }
-
-    private func cleanupAfterFailedStart() {
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        recognitionRequest = nil
-        recognitionTask = nil
-        try? audioCapture?.stop()
-        audioCapture = nil
-        isRunning = false
     }
 
     private func beginSession() {
@@ -190,165 +170,10 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
         sessionAudioSampleRate = nil
         sessionFilesWritten = false
         transcriptAssembler.reset()
-        currentRecognitionBaseFrameCount = 0
-        audioVoiceProfiles = []
-        lastCommittedVoiceProfile = nil
-        currentSpeakerNumber = 1
-        stableChunkCommitTask?.cancel()
-        stableChunkCommitTask = nil
-        transcriptUpdateSequence = 0
         transcript = ""
         lastTranscriptFile = nil
         dailyEventLogFile = nil
         log("Started new capture session.")
-    }
-
-    private func recordCapturedBuffer(_ buffer: AVAudioPCMBuffer) {
-        let startTime = seconds(forFrameCount: sessionAudioFrameCount) ?? currentElapsedTime()
-        sessionAudioFrameCount += AVAudioFramePosition(buffer.frameLength)
-        let endTime = seconds(forFrameCount: sessionAudioFrameCount) ?? currentElapsedTime()
-
-        if let profile = AudioVoiceProfile(buffer: buffer, startTime: startTime, endTime: endTime) {
-            audioVoiceProfiles.append(profile)
-            pruneAudioVoiceProfiles(keepingSeconds: 300)
-        }
-    }
-
-    private func startRecognitionTask() {
-        guard let speechRecognizer else { return }
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.addsPunctuation = true
-        log("Speech partial results enabled internally; only committed completed sentences are displayed.")
-        if speechRecognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-            log("Speech recognizer supports on-device recognition; using on-device mode.")
-        } else {
-            log("Speech recognizer does not report on-device support; using default recognition mode.")
-        }
-
-        currentRecognitionBaseFrameCount = sessionAudioFrameCount
-        transcriptAssembler.resetRecognitionWindow()
-        recognitionRequest = request
-        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
-            Task { @MainActor in
-                guard let self else { return }
-
-                if let result {
-                    self.updateTranscript(with: result)
-
-                    if result.isFinal, self.isRunning {
-                        self.commitCurrentTranscriptLine()
-                        self.recognitionTask = nil
-                        self.recognitionRequest = nil
-                        self.startRecognitionTask()
-                    }
-                }
-
-                if let error, self.isRunning {
-                    self.setStatus("Transcription error: \(error.localizedDescription)")
-                    self.log("Transcription error: \(error.diagnosticDescription)")
-                    self.stop()
-                }
-            }
-        }
-    }
-
-    private func updateTranscript(with result: SFSpeechRecognitionResult) {
-        let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-
-        transcriptAssembler.update(
-            text: text,
-            isFinal: result.isFinal,
-            timestampCandidate: transcriptTimestampCandidate(for: result),
-            endTimestamp: currentElapsedTime(),
-            speakerNumber: { self.speakerNumber(for: $0, previousEndTimestamp: $1) }
-        )
-        transcriptUpdateSequence += 1
-        refreshTranscriptText()
-        scheduleStableChunkCommitIfNeeded()
-    }
-
-    private func commitCurrentTranscriptLine() {
-        stableChunkCommitTask?.cancel()
-        stableChunkCommitTask = nil
-        transcriptAssembler.commitLiveLine { self.speakerNumber(for: $0, previousEndTimestamp: $1) }
-        refreshTranscriptText()
-    }
-
-    private func scheduleStableChunkCommitIfNeeded() {
-        stableChunkCommitTask?.cancel()
-        stableChunkCommitTask = nil
-
-        guard isRunning, transcriptAssembler.liveLine != nil else { return }
-
-        let expectedSequence = transcriptUpdateSequence
-        stableChunkCommitTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.stableChunkDelayNanoseconds)
-
-            await MainActor.run {
-                guard let self,
-                      self.isRunning,
-                      self.transcriptUpdateSequence == expectedSequence,
-                      self.transcriptAssembler.liveLine != nil else {
-                    return
-                }
-
-                self.log("Committed stable transcript chunk after pause.")
-                self.commitCurrentTranscriptLine()
-            }
-        }
-    }
-
-    private func speakerNumber(for line: TranscriptLine, previousEndTimestamp: TimeInterval) -> Int {
-        guard let profile = averageVoiceProfile(from: line.timestamp, to: line.endTimestamp) else {
-            return currentSpeakerNumber
-        }
-
-        defer {
-            lastCommittedVoiceProfile = profile
-        }
-
-        guard let previousProfile = lastCommittedVoiceProfile else {
-            return currentSpeakerNumber
-        }
-
-        let gap = max(0, line.timestamp - previousEndTimestamp)
-        let changeScore = profile.voiceChangeScore(comparedTo: previousProfile)
-
-        if gap >= 0.35, changeScore >= 0.42 {
-            currentSpeakerNumber += 1
-            log(String(format: "Possible speaker change detected near %@. Voice score: %.2f; now Speaker %d.",
-                       TranscriptLine.timestampString(for: line.timestamp),
-                       changeScore,
-                       currentSpeakerNumber))
-        }
-
-        return currentSpeakerNumber
-    }
-
-    private func averageVoiceProfile(from startTime: TimeInterval, to endTime: TimeInterval) -> AudioVoiceProfile? {
-        let paddedStart = max(0, startTime - 0.15)
-        let paddedEnd = max(paddedStart, endTime + 0.15)
-        let overlappingProfiles = audioVoiceProfiles.filter {
-            $0.endTime >= paddedStart && $0.startTime <= paddedEnd && $0.rms > 0.002
-        }
-
-        return AudioVoiceProfile.average(overlappingProfiles, startTime: paddedStart, endTime: paddedEnd)
-    }
-
-    private func pruneAudioVoiceProfiles(keepingSeconds seconds: TimeInterval) {
-        guard let latestTime = audioVoiceProfiles.last?.endTime else { return }
-        let cutoff = latestTime - seconds
-        audioVoiceProfiles.removeAll { $0.endTime < cutoff }
-    }
-
-    private func transcriptTimestampCandidate(for result: SFSpeechRecognitionResult) -> TimeInterval {
-        let speechOffset = result.bestTranscription.segments.first?.timestamp ?? 0
-        let audioOffset = seconds(forFrameCount: currentRecognitionBaseFrameCount) ?? currentElapsedTime()
-        return max(0, audioOffset + speechOffset)
     }
 
     private func currentElapsedTime() -> TimeInterval {
@@ -356,12 +181,7 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
     }
 
     private func refreshTranscriptText() {
-        transcript = transcriptAssembler.committedDisplayText
-    }
-
-    private func seconds(forFrameCount frameCount: AVAudioFramePosition) -> TimeInterval? {
-        guard let sessionAudioSampleRate, sessionAudioSampleRate > 0 else { return nil }
-        return Double(frameCount) / sessionAudioSampleRate
+        transcript = transcriptAssembler.displayText
     }
 
     private func writeSessionFilesAfterStop() {
@@ -472,6 +292,14 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
         }
     }
 
+    private static let modelPath: String = {
+        if let bundlePath = Bundle.main.path(forResource: "ggml-small.en", ofType: "bin") {
+            return bundlePath
+        }
+        let devPath = FileManager.default.currentDirectoryPath + "/models/ggml-small.en.bin"
+        return devPath
+    }()
+
     private static let logTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -511,8 +339,6 @@ final class SystemAudioTranscriber: NSObject, ObservableObject {
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss ZZZZ"
         return formatter
     }()
-
-    private static let stableChunkDelayNanoseconds: UInt64 = 1_500_000_000
 }
 
 private final class ProcessTapAudioCapture {
@@ -769,113 +595,6 @@ private final class ProcessTapAudioCapture {
     }
 }
 
-private struct AudioVoiceProfile {
-    let startTime: TimeInterval
-    let endTime: TimeInterval
-    let rms: Double
-    let zeroCrossingRate: Double
-    let crestFactor: Double
-
-    init?(buffer: AVAudioPCMBuffer, startTime: TimeInterval, endTime: TimeInterval) {
-        guard let channelData = buffer.floatChannelData else { return nil }
-
-        let frameLength = Int(buffer.frameLength)
-        guard frameLength > 16 else { return nil }
-
-        let channelCount = max(1, Int(buffer.format.channelCount))
-        let sampleStride = max(1, frameLength / 2_048)
-        var sampleCount = 0
-        var squareSum = 0.0
-        var absoluteSum = 0.0
-        var peak = 0.0
-        var zeroCrossings = 0
-        var previousSample: Float?
-
-        for channelIndex in 0..<channelCount {
-            let samples = channelData[channelIndex]
-            var frameIndex = 0
-
-            while frameIndex < frameLength {
-                let sample = samples[frameIndex]
-                let sampleValue = Double(sample)
-                let absoluteValue = abs(sampleValue)
-
-                squareSum += sampleValue * sampleValue
-                absoluteSum += absoluteValue
-                peak = max(peak, absoluteValue)
-
-                if let previousSample,
-                   (previousSample < 0 && sample >= 0) || (previousSample >= 0 && sample < 0) {
-                    zeroCrossings += 1
-                }
-
-                previousSample = sample
-                sampleCount += 1
-                frameIndex += sampleStride
-            }
-        }
-
-        guard sampleCount > 0 else { return nil }
-
-        let rms = sqrt(squareSum / Double(sampleCount))
-        guard rms > 0.0001 else { return nil }
-
-        let meanAbsolute = max(absoluteSum / Double(sampleCount), 0.000_001)
-
-        self.startTime = startTime
-        self.endTime = endTime
-        self.rms = rms
-        self.zeroCrossingRate = Double(zeroCrossings) / Double(max(1, sampleCount - 1))
-        self.crestFactor = peak / meanAbsolute
-    }
-
-    private init(startTime: TimeInterval, endTime: TimeInterval, rms: Double, zeroCrossingRate: Double, crestFactor: Double) {
-        self.startTime = startTime
-        self.endTime = endTime
-        self.rms = rms
-        self.zeroCrossingRate = zeroCrossingRate
-        self.crestFactor = crestFactor
-    }
-
-    static func average(_ profiles: [AudioVoiceProfile], startTime: TimeInterval, endTime: TimeInterval) -> AudioVoiceProfile? {
-        guard !profiles.isEmpty else { return nil }
-
-        var totalWeight = 0.0
-        var rmsSum = 0.0
-        var zeroCrossingSum = 0.0
-        var crestSum = 0.0
-
-        for profile in profiles {
-            let overlapStart = max(startTime, profile.startTime)
-            let overlapEnd = min(endTime, profile.endTime)
-            let weight = max(0.001, overlapEnd - overlapStart)
-
-            totalWeight += weight
-            rmsSum += profile.rms * weight
-            zeroCrossingSum += profile.zeroCrossingRate * weight
-            crestSum += profile.crestFactor * weight
-        }
-
-        guard totalWeight > 0 else { return nil }
-
-        return AudioVoiceProfile(
-            startTime: startTime,
-            endTime: endTime,
-            rms: rmsSum / totalWeight,
-            zeroCrossingRate: zeroCrossingSum / totalWeight,
-            crestFactor: crestSum / totalWeight
-        )
-    }
-
-    func voiceChangeScore(comparedTo previous: AudioVoiceProfile) -> Double {
-        let loudnessDistance = min(1, abs(log(max(rms, 0.000_001) / max(previous.rms, 0.000_001))) / 1.4)
-        let zeroCrossingDistance = min(1, abs(zeroCrossingRate - previous.zeroCrossingRate) / 0.18)
-        let crestDistance = min(1, abs(crestFactor - previous.crestFactor) / 3.5)
-
-        return (loudnessDistance * 0.25) + (zeroCrossingDistance * 0.55) + (crestDistance * 0.20)
-    }
-}
-
 private enum TranscriberError: LocalizedError {
     case unsupportedOS
     case unsupportedFormat
@@ -887,28 +606,11 @@ private enum TranscriberError: LocalizedError {
         case .unsupportedOS:
             "Core Audio process taps require macOS 14.2 or later."
         case .unsupportedFormat:
-            "The process tap produced an audio format Speech cannot consume."
+            "The process tap produced an audio format that cannot be consumed."
         case .missingProperty:
             "Core Audio did not return a required property."
         case .coreAudio(let operation, let status):
             "Core Audio failed to \(operation) (\(status.diagnosticDescription))."
-        }
-    }
-}
-
-private extension SFSpeechRecognizerAuthorizationStatus {
-    var description: String {
-        switch self {
-        case .notDetermined:
-            "not determined"
-        case .denied:
-            "denied"
-        case .restricted:
-            "restricted"
-        case .authorized:
-            "authorized"
-        @unknown default:
-            "unknown"
         }
     }
 }
