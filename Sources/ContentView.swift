@@ -86,7 +86,7 @@ struct ContentView: View {
 
                 Spacer()
 
-                Text("Uses Core Audio taps + Speech")
+                Text("Uses Core Audio taps + whisper.cpp")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
