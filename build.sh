@@ -9,24 +9,14 @@ RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 WHISPER_DIR="vendor/whisper.cpp"
 WHISPER_BUILD="${WHISPER_DIR}/build-static"
 
+if [ ! -f "${WHISPER_BUILD}/src/libwhisper.a" ] || [ ! -f "models/ggml-small.en.bin" ]; then
+  echo "Dependencies missing. Run: bash install.sh"
+  exit 1
+fi
+
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 mkdir -p ".build/module-cache"
 cp Info.plist "${CONTENTS_DIR}/Info.plist"
-
-if [ ! -f "${WHISPER_BUILD}/src/libwhisper.a" ]; then
-  echo "Building whisper.cpp static libraries..."
-  cmake -S "${WHISPER_DIR}" -B "${WHISPER_BUILD}" \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DWHISPER_BUILD_EXAMPLES=OFF \
-    -DWHISPER_BUILD_TESTS=OFF \
-    -DWHISPER_BUILD_SERVER=OFF \
-    -DGGML_METAL=ON \
-    -DGGML_ACCELERATE=ON \
-    -DBUILD_SHARED_LIBS=OFF \
-    >/dev/null 2>&1
-  cmake --build "${WHISPER_BUILD}" --config Release -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -5
-fi
 
 echo "Compiling Swift app with whisper.cpp..."
 swiftc \
