@@ -138,14 +138,19 @@ final class WhisperTranscriber: @unchecked Sendable {
         let bufferedSeconds = Double(ringBuffer.count) / Double(sampleRate)
         lock.unlock()
 
-        let startTime = CFAbsoluteTimeGetCurrent()
-        let text = transcribe(chunk)
-        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+        let rms = Self.rmsEnergy(chunk)
+        if rms < 0.002 {
+            onLog?(String(format: "Chunk @%.0fs: silent (rms=%.5f), skipped", chunkTimestamp, rms))
+        } else {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            let text = transcribe(chunk)
+            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
 
-        onLog?(String(format: "Chunk @%.0fs: %.1fs to transcribe, %.1fs buffered", chunkTimestamp, elapsed, bufferedSeconds))
+            onLog?(String(format: "Chunk @%.0fs: %.1fs to transcribe, rms=%.4f, %.1fs buffered", chunkTimestamp, elapsed, rms, bufferedSeconds))
 
-        if !text.isEmpty {
-            onResult?(text, true, chunkTimestamp)
+            if !text.isEmpty, !Self.isHallucination(text) {
+                onResult?(text, true, chunkTimestamp)
+            }
         }
 
         if morePending {
@@ -183,8 +188,10 @@ final class WhisperTranscriber: @unchecked Sendable {
             samplesProcessed += takeCount
             lock.unlock()
 
+            let rms = Self.rmsEnergy(chunk)
+            guard rms >= 0.002 else { continue }
             let text = transcribe(chunk)
-            if !text.isEmpty {
+            if !text.isEmpty, !Self.isHallucination(text) {
                 onResult?(text, true, chunkTimestamp)
             }
         }
@@ -230,6 +237,37 @@ final class WhisperTranscriber: @unchecked Sendable {
 
         free(langStr)
         return result
+    }
+
+    private static func rmsEnergy(_ samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sumSquares: Float = 0
+        for s in samples {
+            sumSquares += s * s
+        }
+        return sqrt(sumSquares / Float(samples.count))
+    }
+
+    private static let hallucinationPatterns: Set<String> = [
+        "you",
+        "thank you",
+        "thanks for watching",
+        "thanks for listening",
+        "bye",
+        "goodbye",
+        "thank you for watching",
+        "thanks",
+        "the end",
+        "subtitles by",
+    ]
+
+    private static func isHallucination(_ text: String) -> Bool {
+        let normalized = text
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: .punctuationCharacters)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return hallucinationPatterns.contains(normalized)
     }
 
     deinit {
